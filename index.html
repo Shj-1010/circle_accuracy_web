@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>원 그리기 정확도 & π 평가 (Web)</title>
+<style>
+  :root {
+    --bg: #101214; --fg: #e0e0e0; --muted: #a7b0b6;
+    --line: #1e88e5; --circle: #00c853; --center: #ff5252;
+    --panel: #15181b; --btn: #263238; --btn-h:#2f3a40;
+    --accent:#4fc3f7;
+  }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Noto Sans KR, Arial, Apple SD Gothic Neo, sans-serif; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  h1 { font-size: 20px; margin: 6px 0 2px; color: var(--fg); }
+  .canvasWrap { position: relative; border-radius: 12px; overflow: hidden; border: 1px solid #23272a; }
+  canvas { width: 100%; height: 60vh; display: block; background: var(--bg); touch-action: none; }
+  .overlayMsg { position: absolute; inset: 0; display: grid; place-items: center; color: #cfd8dc; font-weight: 700; pointer-events: none; }
+  .panel { background: var(--panel); border: 1px solid #23272a; border-radius: 12px; padding: 12px; display: grid; grid-template-columns: repeat(3, 1fr) auto; align-items: center; gap: 10px; }
+  .metric { text-align: center; }
+  .metric .v { font-size: 22px; font-weight: 800; }
+  .metric .k { color: var(--muted); font-size: 12px; letter-spacing: .02em; }
+  .verdict { text-align: center; font-weight: 700; color: var(--accent); }
+  button { background: var(--btn); color: var(--fg); border: 1px solid #37474f; padding: 10px 16px; border-radius: 10px; font-weight: 700; cursor: pointer; }
+  button:hover { background: var(--btn-h); }
+  .hint { color: var(--muted); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 720px) {
+    .panel { grid-template-columns: 1fr 1fr; grid-auto-rows: auto; }
+    .verdict { grid-column: 1 / -1; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>원 그리기 정확도 & 원주율(π) 평가 (Web)</h1>
+
+  <div class="canvasWrap">
+    <canvas id="pad"></canvas>
+    <div id="overlay" class="overlayMsg">캔버스에 원을 그리고 손/마우스를 떼세요</div>
+  </div>
+
+  <div class="panel">
+    <div class="metric"><div class="k">정확도 (1−nRMSE)</div><div id="acc" class="v">-</div></div>
+    <div class="metric"><div class="k">π 추정 (둘레 / 2r)</div><div id="pi" class="v">-</div></div>
+    <div class="metric"><div class="k">닫힘(시작=끝)</div><div id="closed" class="v">-</div></div>
+    <div class="verdict" id="msg"> </div>
+    <button id="reset" style="grid-column: 1 / -1; justify-self: center;">다시하기</button>
+  </div>
+
+  <div class="grid">
+    <div class="hint">팁: 너무 작게 그리면 수치적으로 불안정해질 수 있습니다. 화면의 30% 이상 크기로 한 바퀴에 가깝게 그려주세요.</div>
+    <div class="hint" style="text-align:right">모바일: 손가락/펜으로 그리세요. 데스크톱: 마우스 좌클릭 드래그.</div>
+  </div>
+</div>
+
+<script>
+/*** ====== 구성 파라미터 ====== ***/
+const MIN_POINTS      = 20;
+const RESAMPLE_N      = 512;
+const CLOSE_THRESH_PX = 100.0;      // 시작-끝 거리 임계 (픽셀)
+const HUBER_DELTA_REL = 0.02;       // 반지름 대비 Huber 델타
+const ODR_MAX_ITERS   = 20;
+const ODR_LAMBDA0     = 1e-3;
+
+/*** ====== 유틸 ====== ***/
+const dist = (a,b)=>Math.hypot(a.x-b.x, a.y-b.y);
+function polylineLength(pts, closed=false){
+  if(pts.length<2) return 0;
+  let s=0;
+  for(let i=0;i+1<pts.length;i++) s+=dist(pts[i],pts[i+1]);
+  if(closed) s+=dist(pts[0], pts[pts.length-1]);
+  return s;
+}
+function movingAverage(pts, k=5){
+  if(pts.length<3 || k<=1) return pts.slice();
+  const n = pts.length;
+  k = Math.min(k, Math.max(3, Math.floor(n/20)*2 + 1)); // 홀수
+  const pad = Math.floor(k/2);
+  const x = [], y = [];
+  // 패딩
+  for(let i=0;i<pad;i++){ x.push(pts[0].x); y.push(pts[0].y); }
+  for(const p of pts){ x.push(p.x); y.push(p.y); }
+  for(let i=0;i<pad;i++){ x.push(pts[n-1].x); y.push(pts[n-1].y); }
+  // 컨볼루션(평균)
+  const ker = 1/k;
+  const out=[];
+  for(let i=0;i<=x.length - k; i++){
+    let sx=0, sy=0;
+    for(let j=0;j<k;j++){ sx+=x[i+j]; sy+=y[i+j]; }
+    out.push({x: sx*ker, y: sy*ker});
+  }
+  return out;
+}
+function resampleByArclen(pts, n=RESAMPLE_N, closedForLength=false){
+  if(pts.length<3) return pts.slice();
+  const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+  const dif = [];
+  for(let i=0;i+1<pts.length;i++){
+    const dx = xs[i+1]-xs[i], dy = ys[i+1]-ys[i];
+    dif.push(Math.hypot(dx,dy));
+  }
+  let s=[0];
+  for(const d of dif) s.push(s[s.length-1]+d);
+  let xp=xs.slice(), yp=ys.slice();
+  if(closedForLength){
+    s.push(s[s.length-1] + Math.hypot(xs[0]-xs[xs.length-1], ys[0]-ys[ys.length-1]));
+    xp = xp.concat(xs[0]); yp = yp.concat(ys[0]);
+  }
+  const S = s[s.length-1];
+  if(S<=1e-9) return pts.slice(0,n);
+  const si = Array.from({length:n}, (_,i)=> i*(S/(n-1)));
+  const xi = interp1(s, xp, si), yi = interp1(s, yp, si);
+  return xi.map((x,i)=>({x, y: yi[i]}));
+}
+function interp1(s, v, si){
+  const out=[];
+  let k=0;
+  for(const t of si){
+    while(k+1<s.length && s[k+1]<t) k++;
+    const s0=s[k], s1=s[k+1] ?? s[k], v0=v[k], v1=v[k+1] ?? v[k];
+    const a = (s1===s0)?0: (t-s0)/(s1-s0);
+    out.push(v0 + a*(v1-v0));
+  }
+  return out;
+}
+
+/*** ====== 원 적합 ====== ***/
+// 알제브라 최소제곱 초기값 (x^2 + y^2 + ax + by + c = 0)
+function fitCircleAlgebraic(pts){
+  if(pts.length<3) return {ok:false, xc:0, yc:0, r:0};
+  const n=pts.length;
+  // A*[a,b,1]^T = -(x^2+y^2)
+  let Sxx=0,Sxy=0,Sx=0,Syy=0,Sy=0, Sz=0, Sxz=0,Syz=0;
+  for(const p of pts){
+    const x=p.x, y=p.y, z=-(x*x+y*y);
+    Sxx+=x*x; Sxy+=x*y; Sx+=x;
+    Syy+=y*y; Sy+=y;
+    Sz+=z;    Sxz+=x*z; Syz+=y*z;
+  }
+  // Solve [ [Sxx,Sxy,Sx],[Sxy,Syy,Sy],[Sx,Sy,n] ] * [a,b,c]^T = [Sxz,Syz,Sz]
+  const M = [[Sxx,Sxy,Sx],[Sxy,Syy,Sy],[Sx,Sy,n]];
+  const rhs=[Sxz,Syz,Sz];
+  const sol = solve3(M, rhs);
+  if(!sol) return {ok:false, xc:0, yc:0, r:0};
+  const [a,b,c]=sol;
+  const xc = -a/2, yc = -b/2;
+  const r2 = (a*a + b*b)/4 - c;
+  if(!(r2>0 && isFinite(r2))) return {ok:false, xc:0,yc:0,r:0};
+  return {ok:true, xc, yc, r: Math.sqrt(r2)};
+}
+function solve3(M, b){
+  // 가우스 소거
+  const A = M.map((row,i)=>row.concat(b[i]));
+  const n=3;
+  for(let i=0;i<n;i++){
+    // pivot
+    let p=i;
+    for(let r=i+1;r<n;r++) if(Math.abs(A[r][i])>Math.abs(A[p][i])) p=r;
+    if(Math.abs(A[p][i])<1e-12) return null;
+    if(p!==i) [A[i],A[p]] = [A[p],A[i]];
+    // normalize
+    const piv=A[i][i];
+    for(let c=i;c<=n;c++) A[i][c]/=piv;
+    // eliminate
+    for(let r=0;r<n;r++){
+      if(r===i) continue;
+      const f=A[r][i];
+      for(let c=i;c<=n;c++) A[r][c]-=f*A[i][c];
+    }
+  }
+  return [A[0][3],A[1][3],A[2][3]];
+}
+// ODR + Huber + LM
+function fitCircleODR(pts, p0, maxIters=ODR_MAX_ITERS){
+  let xc=p0.xc, yc=p0.yc, r=p0.r;
+  let lam=ODR_LAMBDA0, eps=1e-9;
+  const huberDelta = Math.max(1.5, HUBER_DELTA_REL * Math.max(r,1.0));
+  function sse(xc_,yc_,r_){
+    let SSE=0;
+    for(const p of pts){
+      const d=Math.hypot(p.x-xc_, p.y-yc_) + eps;
+      const res=d-r_;
+      SSE+=res*res;
+    }
+    return SSE;
+  }
+  let ssePrev = sse(xc,yc,r);
+  for(let it=0; it<maxIters; it++){
+    const n=pts.length;
+    const d = new Array(n), res = new Array(n);
+    for(let i=0;i<n;i++){
+      const p=pts[i];
+      d[i]=Math.hypot(p.x-xc, p.y-yc)+eps;
+      res[i]=d[i]-r;
+    }
+    // Huber weights
+    const w=res.map(v=>{
+      const av=Math.abs(v);
+      return (av>huberDelta)? (huberDelta/(av+eps)) : 1.0;
+    });
+    // J: [(xc-x)/d, (yc-y)/d, -1]
+    let JTJ=[[lam,0,0],[0,lam,0],[0,0,lam]], JTr=[0,0,0];
+    for(let i=0;i<n;i++){
+      const p=pts[i];
+      const j0=(xc-p.x)/d[i], j1=(yc-p.y)/d[i], j2=-1.0;
+      const wi=Math.sqrt(w[i]);
+      const jw0=j0*wi, jw1=j1*wi, jw2=j2*wi;
+      const rw=res[i]*wi;
+      // JTJ += J^T J
+      JTJ[0][0]+=jw0*jw0; JTJ[0][1]+=jw0*jw1; JTJ[0][2]+=jw0*jw2;
+      JTJ[1][0]+=jw1*jw0; JTJ[1][1]+=jw1*jw1; JTJ[1][2]+=jw1*jw2;
+      JTJ[2][0]+=jw2*jw0; JTJ[2][1]+=jw2*jw1; JTJ[2][2]+=jw2*jw2;
+      // JTr += J^T r
+      JTr[0]+=jw0*rw; JTr[1]+=jw1*rw; JTr[2]+=jw2*rw;
+    }
+    const delta = solve3(JTJ, JTr);
+    if(!delta) break;
+    const xcN=xc - delta[0], ycN=yc - delta[1], rN=r - delta[2];
+    const sseN = sse(xcN, ycN, rN);
+    if(sseN < ssePrev){
+      xc=xcN; yc=ycN; r=rN; ssePrev=sseN; lam=Math.max(lam*0.5, 1e-6);
+      const norm=Math.hypot(delta[0],delta[1],delta[2]);
+      if(norm<1e-4) break;
+    } else {
+      lam*=2.0;
+    }
+  }
+  return {xc, yc, r, sse: ssePrev};
+}
+
+/*** ====== 평가 ====== ***/
+function polygonAreaPerimeter(ptsClosed){
+  if(ptsClosed.length<3) return {area:0, perim:0};
+  const n=ptsClosed.length;
+  const xs=ptsClosed.map(p=>p.x), ys=ptsClosed.map(p=>p.y);
+  let area=0;
+  for(let i=0;i+1<n;i++){
+    area += xs[i]*ys[i+1] - ys[i]*xs[i+1];
+  }
+  area += xs[n-1]*ys[0] - ys[n-1]*xs[0];
+  area = 0.5*Math.abs(area);
+  const perim = polylineLength(ptsClosed, true);
+  return {area, perim};
+}
+function evaluate(pointsXY){
+  if(pointsXY.length<MIN_POINTS) return null;
+  // 평활 + 재샘플
+  const sm = movingAverage(pointsXY, 5);
+  const U  = resampleByArclen(sm, RESAMPLE_N, false);
+
+  // 알제브라 초기값
+  const init = fitCircleAlgebraic(U);
+  if(!init.ok || !(init.r>3 && isFinite(init.r))) return null;
+
+  // ODR 정밀화
+  const odr = fitCircleODR(U, init);
+
+  // 닫힘 판정 (요청 규칙)
+  const start=U[0], end=U[U.length-1];
+  const distSE = dist(start,end);
+  const closedOK = (distSE <= CLOSE_THRESH_PX);
+
+  // 정확도 (1−nRMSE; ODR 중심·반지름 기준)
+  const dists = U.map(p=>Math.hypot(p.x-odr.xc, p.y-odr.yc));
+  const rMean = dists.reduce((a,b)=>a+b,0)/dists.length;
+  const mse = dists.reduce((a,di)=>a + (di-rMean)*(di-rMean), 0)/dists.length;
+  const nrmse = Math.sqrt(mse)/(rMean+1e-9);
+  const accuracy = Math.max(0, Math.min(1, 1-nrmse));
+
+  // π 추정 (닫힌 길이 / 2r)
+  const closedPoly = resampleByArclen(sm, RESAMPLE_N, true);
+  const Lclosed = polylineLength(closedPoly, true);
+  const piEst = Lclosed/(2*odr.r + 1e-9);
+
+  // 판정
+  let verdict="";
+  if(!closedOK) verdict="시작점과 끝점이 일치하지 않습니다!";
+  else if(piEst <= 2.0 || piEst >= 5.0) verdict="원이 아닙니다!";
+
+  return { xc:odr.xc, yc:odr.yc, r:odr.r, accuracy, pi:piEst, closedOK, verdict };
+}
+
+/*** ====== UI/입력 ====== ***/
+const canvas = document.getElementById('pad');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const accEl = document.getElementById('acc');
+const piEl  = document.getElementById('pi');
+const closedEl = document.getElementById('closed');
+const msgEl = document.getElementById('msg');
+const btnReset = document.getElementById('reset');
+
+let points=[], drawing=false, result=null, locked=false;
+
+function resizeCanvas(){
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height= Math.round(rect.height* dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  render();
+}
+window.addEventListener('resize', resizeCanvas, {passive:true});
+resizeCanvas();
+
+// 입력 좌표 보정
+function getPos(e){
+  const rect = canvas.getBoundingClientRect();
+  const px = (ev)=>({
+    x: (ev.clientX - rect.left),
+    y: (ev.clientY - rect.top)
+  });
+  if(e.touches && e.touches.length>0) return px(e.touches[0]);
+  if(e.changedTouches && e.changedTouches.length>0) return px(e.changedTouches[0]);
+  return px(e);
+}
+
+function begin(pos){
+  if(locked) return;
+  points=[pos]; drawing=true; result=null;
+  overlay.style.display='none';
+  render();
+}
+function addPoint(pos){
+  if(locked || !drawing) return;
+  if(points.length){
+    const last=points[points.length-1];
+    if((pos.x-last.x)**2 + (pos.y-last.y)**2 < 1.0) return;
+  }
+  points.push(pos);
+  render();
+}
+function endDraw(){
+  drawing=false;
+  if(points.length>=MIN_POINTS){
+    result = evaluate(points);
+  }else{
+    result = null;
+  }
+  locked=true;
+  updatePanel();
+  render();
+}
+function resetAll(){
+  locked=false; drawing=false; points=[]; result=null;
+  overlay.style.display='';
+  updatePanel();
+  render();
+}
+
+canvas.addEventListener('pointerdown', (e)=>{ canvas.setPointerCapture(e.pointerId); begin(getPos(e)); });
+canvas.addEventListener('pointermove', (e)=>{ addPoint(getPos(e)); });
+canvas.addEventListener('pointerup',   (e)=>{ if(drawing) endDraw(); });
+canvas.addEventListener('touchstart', (e)=>{ e.preventDefault(); begin(getPos(e)); }, {passive:false});
+canvas.addEventListener('touchmove',  (e)=>{ e.preventDefault(); addPoint(getPos(e)); }, {passive:false});
+canvas.addEventListener('touchend',   (e)=>{ e.preventDefault(); if(drawing) endDraw(); }, {passive:false});
+
+btnReset.addEventListener('click', resetAll);
+
+function drawCrosshair(){
+  const w=canvas.clientWidth, h=canvas.clientHeight;
+  ctx.save();
+  ctx.strokeStyle = "#3c4043";
+  ctx.setLineDash([6,6]);
+  ctx.beginPath();
+  ctx.moveTo(w/2, 0); ctx.lineTo(w/2, h);
+  ctx.moveTo(0, h/2); ctx.lineTo(w, h/2);
+  ctx.stroke();
+  ctx.restore();
+}
+function render(){
+  const w=canvas.clientWidth, h=canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  // 배경은 CSS
+  drawCrosshair();
+
+  // 궤적
+  if(points.length>=2){
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--line').trim();
+    ctx.lineWidth=3; ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for(let i=1;i<points.length;i++) ctx.lineTo(points[i].x, points[i].y);
+    ctx.stroke();
+  }
+
+  // 적합 원
+  if(result){
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--circle').trim();
+    ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.arc(result.xc, result.yc, result.r, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--center').trim();
+    ctx.beginPath();
+    ctx.arc(result.xc, result.yc, 3.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+function updatePanel(){
+  if(!result){
+    accEl.textContent = '-';
+    piEl.textContent  = '-';
+    closedEl.textContent = '-';
+    msgEl.textContent = '';
+    return;
+  }
+  accEl.textContent = (result.accuracy*100).toFixed(1) + '%';
+  piEl.textContent  = result.pi.toFixed(5);
+  closedEl.textContent = result.closedOK ? 'OK' : '불일치';
+  msgEl.textContent = result.verdict || '정상';
+}
+</script>
+</body>
+</html>
