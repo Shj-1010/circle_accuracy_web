@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>원 그리기 정확도 & π 평가 (Web)</title>
+<title>원 그리기</title>
 <style>
   :root {
     --bg: #101214; --fg: #e0e0e0; --muted: #a7b0b6;
@@ -244,6 +244,19 @@ function polygonAreaPerimeter(ptsClosed){
   const perim = polylineLength(ptsClosed, true);
   return {area, perim};
 }
+// 점이 단순 다각형 내부에 있는지 (ray casting)
+function pointInPolygon(pt, poly){
+  let inside = false;
+  for(let i=0, j=poly.length-1; i<poly.length; j=i++){
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    const intersect = ((yi > pt.y) !== (yj > pt.y)) &&
+                      (pt.x < (xj - xi) * (pt.y - yi) / ((yj - yi) || 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 function evaluate(pointsXY){
   if(pointsXY.length<MIN_POINTS) return null;
   // 평활 + 재샘플
@@ -274,10 +287,18 @@ function evaluate(pointsXY){
   const Lclosed = polylineLength(closedPoly, true);
   const piEst = Lclosed/(2*odr.r + 1e-9);
 
-  // 판정
-  let verdict="";
-  if(!closedOK) verdict="시작점과 끝점이 일치하지 않습니다!";
-  else if(piEst <= 2.0 || piEst >= 5.0) verdict="원이 아닙니다!";
+  // 추가: 중심이 폐곡선 내부에 있는지 검사
+  const centerInside = pointInPolygon({x: odr.xc, y: odr.yc}, closedPoly);
+
+ // 판정(우선순위: 닫힘 → 중심내부 → π 범위)
+  let verdict = "";
+  if (!closedOK) {
+    verdict = "시작점과 끝점이 일치하지 않습니다!";
+  } else if (!centerInside) {
+    verdict = "원의 중심이 폐곡선 내부에 있지 않습니다!";   // ← 새 규칙
+  } else if (piEst <= 2.0 || piEst >= 5.0) {
+    verdict = "원이 아닙니다!";
+  }
 
   return { xc:odr.xc, yc:odr.yc, r:odr.r, accuracy, pi:piEst, closedOK, verdict };
 }
